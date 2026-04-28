@@ -1,0 +1,310 @@
+# ═══════════════════════════════════════════════════════════════
+#  CI Pipeline — egitim-ci-demo
+#  Katmanlar:
+#    1. [Paralel] lint + test + secret-scan
+#    2. docker-build  (hepsi geçince)
+#    3. security-scan (build sonrası)
+#    4. push          (sadece main branch'te)
+#    5. notify        (her durumda — if: always())
+# ═══════════════════════════════════════════════════════════════
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'package*.json'
+      - 'Dockerfile'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Hedef ortam'
+        required: true
+        type: choice
+        options: [dev, staging, production]
+        default: dev
+
+# Aynı branch'e hızlı push gelirse eskiyi iptal et
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Global environment değişkenleri ──────────────────────────
+env:
+  NODE_VERSION: '20'
+  IMAGE_NAME:   egitim-ci-demo
+
+jobs:
+  # ╔══════════════════════════════════════════════════════════╗
+  # ║  KATMAN 1-A — Lint                                       ║
+  # ╚══════════════════════════════════════════════════════════╝
+  lint:
+    name: 🔍 Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodu İndir
+        uses: actions/checkout@v4
+
+      - name: Node.js Kur
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm                          # ← built-in npm cache!
+
+      - name: Bağımlılıkları Yükle
+        run: npm ci
+
+      - name: ESLint Çalıştır
+        run: npm run lint
+
+  # ╔══════════════════════════════════════════════════════════╗
+  # ║  KATMAN 1-B — Test                                       ║
+  # ╚══════════════════════════════════════════════════════════╝
+  test:
+    name: 🧪 Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodu İndir
+        uses: actions/checkout@v4
+
+      - name: Node.js Kur
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Bağımlılıkları Yükle
+        run: npm ci
+
+      - name: Testleri Çalıştır (Coverage ile)
+        run: npm test
+        env:
+          NODE_ENV: test
+
+      - name: Coverage Raporunu Kaydet
+        uses: actions/upload-artifact@v4
+        if: always()                          # test başarısız olsa bile kaydet
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+  # ╔══════════════════════════════════════════════════════════╗
+  # ║  KATMAN 1-C — Secret Scan                                ║
+  # ╚══════════════════════════════════════════════════════════╝
+  secret-scan:
+    name: 🔑 Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodu İndir
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                      # tüm git history — gitleaks için
+
+      - name: Gitleaks ile Secret Tara
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ╔══════════════════════════════════════════════════════════╗
+  # ║  KATMAN 2 — Docker Build                                 ║
+  # ║  (lint + test + secret-scan hepsi geçince başlar)        ║
+  # ╚══════════════════════════════════════════════════════════╝
+  docker-build:
+    name: 🐳 Docker Build
+    runs-on: ubuntu-latest
+    needs: [lint, test, secret-scan]
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}   # sonraki job'lara aktar
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Kodu İndir
+        uses: actions/checkout@v4
+
+      - name: Docker Buildx Kur
+        uses: docker/setup-buildx-action@v3
+
+      - name: Image Metadata Oluştur
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=ref,event=pr
+
+      - name: Docker Image Build Et (Push Olmadan)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false                         # sadece build — push sonraki katmanda
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha               # GitHub Actions cache
+          cache-to:   type=gha,mode=max
+          load: true                          # local docker'a yükle (scan için)
+
+      - name: Image Boyutunu Göster
+        run: |
+          echo "📦 Image boyutu:"
+          docker image inspect ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --format='{{.Size}}' | numfmt --to=iec
+
+  # ╔══════════════════════════════════════════════════════════╗
+  # ║  KATMAN 3 — Security Scan                                ║
+  # ╚══════════════════════════════════════════════════════════╝
+  security-scan:
+    name: 🛡️ Security Scan
+    runs-on: ubuntu-latest
+    needs: docker-build
+
+    permissions:
+      security-events: write                  # SARIF upload için
+
+    steps:
+      - name: Kodu İndir
+        uses: actions/checkout@v4
+
+      - name: Docker Buildx Kur
+        uses: docker/setup-buildx-action@v3
+
+      - name: Image'ı Tekrar Build Et (Scan için)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha               # cache'ten gelir — hızlı!
+          load: true
+
+      - name: Trivy ile Container Tara
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:  '${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          format:     sarif
+          output:     trivy-results.sarif
+          severity:   CRITICAL,HIGH
+          exit-code:  '1'                    # CRITICAL/HIGH varsa pipeline dur!
+
+      - name: Trivy Sonuçlarını GitHub Security Tab'a Yükle
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()                          # hata olsa bile yükle
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ╔══════════════════════════════════════════════════════════╗
+  # ║  KATMAN 4 — Registry Push                                ║
+  # ║  (sadece main branch'te çalışır)                         ║
+  # ╚══════════════════════════════════════════════════════════╝
+  push:
+    name: 🚀 Push to Registry
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+    permissions:
+      id-token: write                         # OIDC için zorunlu!
+      contents: read
+
+    env:
+      REGISTRY:   europe-west1-docker.pkg.dev
+      PROJECT_ID: your-gcp-project-id        # ← değiştirin
+      REPO:       your-artifact-repo          # ← değiştirin
+
+    steps:
+      - name: Kodu İndir
+        uses: actions/checkout@v4
+
+      - name: Docker Buildx Kur
+        uses: docker/setup-buildx-action@v3
+
+      - name: GCP'ye OIDC ile Authenticate Ol
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: gcloud CLI Kur
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Artifact Registry'e Login Ol
+        run: gcloud auth configure-docker ${{ env.REGISTRY }} --quiet
+
+      - name: Build Et ve Push Yap
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push:    true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.IMAGE_NAME }}:latest-main
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+
+      - name: Push Özeti
+        run: |
+          echo "✅ Image başarıyla push edildi!"
+          echo "📍 Registry : ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.REPO }}"
+          echo "🏷️  Tag      : ${{ github.sha }}"
+
+  # ╔══════════════════════════════════════════════════════════╗
+  # ║  KATMAN 5 — Notify                                       ║
+  # ║  (her durumda çalışır — başarı da, başarısızlık da)      ║
+  # ╚══════════════════════════════════════════════════════════╝
+  notify:
+    name: 🔔 Notify
+    runs-on: ubuntu-latest
+    needs: [lint, test, secret-scan, docker-build, security-scan]
+    if: always()                              # her durumda çalış!
+
+    steps:
+      - name: Pipeline Sonucu Belirle
+        id: result
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=❌"       >> $GITHUB_OUTPUT
+            echo "color=danger"  >> $GITHUB_OUTPUT
+          elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "status=cancelled" >> $GITHUB_OUTPUT
+            echo "emoji=⚠️"         >> $GITHUB_OUTPUT
+            echo "color=warning"   >> $GITHUB_OUTPUT
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "emoji=✅"       >> $GITHUB_OUTPUT
+            echo "color=good"     >> $GITHUB_OUTPUT
+          fi
+
+      - name: Slack'e Bildir
+        if: ${{ secrets.SLACK_WEBHOOK != '' }}
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ steps.result.outputs.emoji }} *CI Pipeline ${{ steps.result.outputs.status }}*",
+              "attachments": [{
+                "color": "${{ steps.result.outputs.color }}",
+                "fields": [
+                  { "title": "Repository", "value": "${{ github.repository }}", "short": true },
+                  { "title": "Branch",     "value": "${{ github.ref_name }}",   "short": true },
+                  { "title": "Commit",     "value": "${{ github.sha }}",         "short": true },
+                  { "title": "Tetikleyen","value": "${{ github.actor }}",        "short": true },
+                  { "title": "Detay",     "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

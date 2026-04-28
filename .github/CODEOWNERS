@@ -1,0 +1,8 @@
+# Her değişiklik için default reviewer
+* @your-org/senior-devs
+
+# Workflow ve CI değişiklikleri → DevOps onayı şart
+.github/ @your-org/devops-team
+
+# Docker ve altyapı dosyaları
+Dockerfile @your-org/devops-team
