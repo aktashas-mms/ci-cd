@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────
 # STAGE 1: Builder — bağımlılıkları kur & build al
 # ─────────────────────────────────────────────
-FROM node:20-alpine AS builder
+FROM node:20.19-alpine3.21 AS builder
 
 WORKDIR /app
 
